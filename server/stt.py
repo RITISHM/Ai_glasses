@@ -2,16 +2,12 @@ from faster_whisper import WhisperModel
 import torch
 
 
-# Load the model python s 
-# arge-v2 is high quality; choose smaller models for speed)
+# Load the model python stt
 model_size = "small"
-model = WhisperModel(model_size, device="cuda")  # force GPU usage
+stt_model = WhisperModel(model_size, device="cuda")  # force GPU usage
+print ("STT setup is done ✅")
 
-# # Path to your audio file (WAV or MP3)
-# audio_path = "indian_accent.mp3"
-# for i in range(5):
-# # Transcribe
-#     segments, info = model.transcribe(audio_path, beam_size=10,language="en")
-
-
-#     for segment in segments:
+def speech_to_text(input_audio_path):
+   segments, info = stt_model.transcribe(input_audio_path, beam_size=10)
+   text = " , ".join([seg.text for seg in segments])
+   return text

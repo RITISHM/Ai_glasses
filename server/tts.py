@@ -1,15 +1,18 @@
 import pyttsx3
 
-engine = pyttsx3.init()
+tts_model = pyttsx3.init()
 
 # List all voices
-voices = engine.getProperty('voices')
-for voice in voices:
-    print(voice.id)
-
-# Set Hindi voice (replace with actual ID from above)
-engine.setProperty('voice', voices[0])  # e.g., 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_HI-IN_Hemant_11.0'
-engine.setProperty('rate', 150)  # Default is ~200
-
+voices = tts_model.getProperty('voices')
+#Set the voice id ( 0 for male and 1 for female) 
+tts_model.setProperty('voice', voices[0])
+#Set voice speed
+tts_model.setProperty('rate', 150) 
 # Set volume (0.0 to 1.0)
-engine.setProperty('volume', 0.9)
+tts_model.setProperty('volume', 0.9)
+print ("TTS setup is done ✅")
+
+def text_to_speech(text,response_audio_path):
+  tts_model.save_to_file(text, response_audio_path)
+  tts_model.runAndWait()
+   
