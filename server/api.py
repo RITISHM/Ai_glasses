@@ -15,8 +15,10 @@ TIMESTAMP=""
 genai.configure(api_key=SECRET_KEY)
 llm_model = genai.GenerativeModel(MODEL_ID, system_instruction=INSTRUCTION)
 print ("API setup is done ✅")
+print ("instruction=",INSTRUCTION)
 
 def start_chat():
+  global chat
   chat=llm_model.start_chat()
   TIMESTAMP=datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
   print("New chat started")
@@ -31,6 +33,10 @@ def generate_prompt_response(prompt):
   return response
 
 def end_chat(loc):
+  global chat
+  if chat is None:
+    print("No chat to end")
+    return
   loc=os.path.join(loc,TIMESTAMP)
   with open(loc, "w") as f:
     json.dump(chat.history, f)

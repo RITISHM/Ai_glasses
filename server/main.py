@@ -91,3 +91,4 @@ def audio_response():
 def end_conversation():
   end_chat(HISTORY_FOLDER)
   CHAT_STARTED=False
+  return "Chat ended and saved",200
