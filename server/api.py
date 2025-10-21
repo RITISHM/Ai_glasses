@@ -14,7 +14,7 @@ TIMESTAMP=""
 # Set your API key
 genai.configure(api_key=SECRET_KEY)
 llm_model = genai.GenerativeModel(MODEL_ID, system_instruction=INSTRUCTION)
-
+print ("API setup is done ✅")
 
 def start_chat():
   chat=llm_model.start_chat()
