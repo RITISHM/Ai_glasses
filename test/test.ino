@@ -50,10 +50,10 @@ void setup() {
     audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
     
     // Set Volume
-    audio.setVolume(17);
+    audio.setVolume(20);
     
     // Open music file
-    audio.connecttoFS(SD,"/indian_accent.mp3");
+    audio.connecttoFS(SD,"response.mp3");
     
 }
  
@@ -64,7 +64,7 @@ void loop()
 
   if (!audio.isRunning()) {
     Serial.println("Playback finished. Restarting...");
-    audio.connecttoFS(SD, "/indian_accent.mp3");  // Reconnect to restart playback
+    audio.connecttoFS(SD, "response.mp3");  // Reconnect to restart playback
   }
 
 }

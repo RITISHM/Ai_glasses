@@ -15,7 +15,7 @@ TIMESTAMP=""
 genai.configure(api_key=SECRET_KEY)
 llm_model = genai.GenerativeModel(MODEL_ID, system_instruction=INSTRUCTION)
 print ("API setup is done ✅")
-print ("instruction=",INSTRUCTION)
+
 
 def start_chat():
   global chat
@@ -25,11 +25,11 @@ def start_chat():
 
 def generate_image_response(image_loc,prompt):
   image = Image.open(image_loc)
-  response=llm_model.model.generate_content([prompt,image])
+  response=llm_model.generate_content(prompt).text
   return response
 
 def generate_prompt_response(prompt):
-  response=llm_model.model.generate_content(prompt)
+  response=llm_model.generate_content(prompt).text
   return response
 
 def end_chat(loc):

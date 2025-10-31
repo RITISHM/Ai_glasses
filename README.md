@@ -89,8 +89,10 @@ Auralens/
 │   ├── tts/            # Pyttsx3 TTS engine
 │   └── utils/          # Helper utilities and preprocessing
 │
-└── README.md
-└── README.md
+├── README.md
+├── run.py
+├── .gitignore
+└── requirements.txt
 ```
 
 ---
@@ -199,4 +201,3 @@ This project is licensed under the **MIT License** — open for learning, innova
 **Developed with ❤️ by [Ritish Mahajan](https://github.com/RITISHM)**
 
 </div>
-```
