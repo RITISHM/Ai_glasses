@@ -21,16 +21,76 @@ I2SClass i2s;
 WebsocketsClient wsClient;
 bool uploadComplete = false;
 bool systemReady = false;
+File downloadFile;
+size_t expectedDownloadSize = 0;
+size_t downloadedBytes = 0;
+bool receivingAudio = false;
 
 // ========== CALLBACKS ==========
 void onMessageCallback(WebsocketsMessage message) {
-  Serial.printf("📨 Server: %s\n", message.data().c_str());
-  uploadComplete = true;
+  if (message.isText()) {
+    // Parse JSON response
+    String msg = message.data();
+    Serial.printf("📨 Server: %s\n", msg.c_str());
+    
+    // Check if server is sending audio back
+    if (msg.indexOf("\"audio_size\":") >= 0) {
+      // Extract audio size from JSON
+      int sizeStart = msg.indexOf("\"audio_size\":") + 13;
+      int sizeEnd = msg.indexOf(",", sizeStart);
+      if (sizeEnd < 0) sizeEnd = msg.indexOf("}", sizeStart);
+      
+      String sizeStr = msg.substring(sizeStart, sizeEnd);
+      expectedDownloadSize = sizeStr.toInt();
+      
+      Serial.printf("📥 Server sending audio: %d bytes\n", expectedDownloadSize);
+      
+      // Open file for writing
+      downloadFile = SD.open("/response.wav", FILE_WRITE);
+      if (downloadFile) {
+        receivingAudio = true;
+        downloadedBytes = 0;
+        Serial.println("💾 Ready to receive audio...");
+      } else {
+        Serial.println("❌ Failed to open response.wav!");
+      }
+    } else {
+      uploadComplete = true;
+    }
+  } 
+  else if (message.isBinary() && receivingAudio) {
+    // Receive audio data chunks
+    size_t dataSize = message.length();
+    downloadFile.write((uint8_t*)message.c_str(), dataSize);
+    downloadedBytes += dataSize;
+    
+    float progress = (downloadedBytes * 100.0) / expectedDownloadSize;
+    if (downloadedBytes % 20480 == 0 || downloadedBytes >= expectedDownloadSize) {
+      Serial.printf("  📥 Downloaded: %d / %d bytes (%.1f%%)\n", 
+                    downloadedBytes, expectedDownloadSize, progress);
+    }
+    
+    // Check if download complete
+    if (downloadedBytes >= expectedDownloadSize) {
+      downloadFile.close();
+      receivingAudio = false;
+      uploadComplete = true;
+      Serial.println("✅ Audio file downloaded successfully!");
+      Serial.println("💾 Saved as: /response.wav");
+    }
+  }
 }
 
 void onEventsCallback(WebsocketsEvent event, String data) {
   if (event == WebsocketsEvent::ConnectionClosed) {
     Serial.println("⚠️ Connection closed");
+    if (receivingAudio && downloadFile) {
+      // Close file even if incomplete
+      downloadFile.close();
+      Serial.printf("💾 Saved partial download: %d bytes\n", downloadedBytes);
+      receivingAudio = false;
+      uploadComplete = true;  // Mark as complete to exit wait loop
+    }
   }
 }
 
@@ -193,6 +253,8 @@ void uploadRecordingReliable(size_t fileSize) {
   wsClient.onMessage(onMessageCallback);
   wsClient.onEvent(onEventsCallback);
   uploadComplete = false;
+  receivingAudio = false;
+  downloadedBytes = 0;
 
   Serial.print("🔗 Connecting...");
   unsigned long wsConnectStart = millis();
@@ -272,10 +334,10 @@ void uploadRecordingReliable(size_t fileSize) {
   wsClient.send("EOF");
   Serial.println("📨 Sent EOF marker");
 
-  // Wait for server response
+  // Wait for server response and audio download
   Serial.print("⏳ Waiting for response...");
   unsigned long waitStart = millis();
-  int timeout = 10000;
+  int timeout = 30000;  // Increased timeout for audio download
   
   while (!uploadComplete && (millis() - waitStart < timeout)) {
     wsClient.poll();
