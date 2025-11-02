@@ -9,13 +9,20 @@ using namespace websockets;
 // ========== CONFIGURATION ==========
 const char* ssid = "Ritish";
 const char* password = "07867860";
-const char* ws_server = "ws://10.143.92.72:5000/upload";
+const char* ws_server = "ws://172.16.191.72:5000/upload";
 
 // Recording settings
 const int SAMPLE_RATE = 16000;
 const int TOUCH_THRESHOLD = 40000;
 const int CHUNK_SIZE = 4096;
-const int UPLOAD_CHUNK_SIZE = 4096;  // Smaller chunks are more reliable
+const int UPLOAD_CHUNK_SIZE = 4096;
+
+// I2S pins
+const int I2S_MIC_SERIAL_CLOCK = 42;
+const int I2S_MIC_LEFT_RIGHT_CLOCK = 41;
+const int I2S_SPK_SERIAL_DATA = 1;      // DIN pin of MAX98357
+const int I2S_SPK_LEFT_RIGHT_CLOCK = 5; // LRC pin of MAX98357
+const int I2S_SPK_SERIAL_CLOCK = 4;     // BCLK pin of MAX98357
 
 I2SClass i2s;
 WebsocketsClient wsClient;
@@ -25,6 +32,9 @@ File downloadFile;
 size_t expectedDownloadSize = 0;
 size_t downloadedBytes = 0;
 bool receivingAudio = false;
+
+// ========== FORWARD DECLARATIONS ==========
+void playAudioFile(const char* filename);
 
 // ========== CALLBACKS ==========
 void onMessageCallback(WebsocketsMessage message) {
@@ -77,6 +87,11 @@ void onMessageCallback(WebsocketsMessage message) {
       uploadComplete = true;
       Serial.println("✅ Audio file downloaded successfully!");
       Serial.println("💾 Saved as: /response.wav");
+      Serial.println("🔊 Starting playback...\n");
+      
+      // Play the audio file
+      delay(500);  // Brief pause before playback
+      playAudioFile("/response.wav");
     }
   }
 }
@@ -99,8 +114,8 @@ void setup() {
   Serial.begin(115200);
   delay(3000);
   
-  Serial.println("\n\n🎤 Touch-Controlled Audio Recorder (RELIABLE FAST)");
-  Serial.println("==================================================\n");
+  Serial.println("\n\n🎤 Touch-Controlled Audio Recorder with Playback");
+  Serial.println("================================================\n");
 
   // === Configure Touch Pin ===
   Serial.println("⚙️ Configuring touch sensor...");
@@ -116,9 +131,9 @@ void setup() {
   }
   Serial.println(" ✅");
 
-  // === I2S Init ===
+  // === I2S Init for Microphone ===
   Serial.print("🎙️ Initializing microphone...");
-  i2s.setPinsPdmRx(42, 41);
+  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
   if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     Serial.println(" ❌ FAILED!");
     while(1) delay(1000);
@@ -160,9 +175,9 @@ void loop() {
     return;
   }
   
-  int touchValue = touchRead(T1);
+  int touchValue = touchRead(T2);
   
-  if (touchValue < TOUCH_THRESHOLD) {
+  if (touchValue > TOUCH_THRESHOLD) {
     Serial.println("👆 Touch detected! Recording...");
     
     unsigned long recordStart = millis();
@@ -182,7 +197,7 @@ void loop() {
     uint8_t buffer[CHUNK_SIZE];
     int dotCount = 0;
     
-    while (touchRead(T1) < TOUCH_THRESHOLD) {
+    while (touchRead(T2) > TOUCH_THRESHOLD) {
       size_t bytesRead = i2s.readBytes((char*)buffer, CHUNK_SIZE);
       if (bytesRead > 0) {
         file.write(buffer, bytesRead);
@@ -369,4 +384,91 @@ void uploadRecordingReliable(size_t fileSize) {
   free(buffer);
   wsClient.close();
   Serial.printf("💾 Free heap: %d bytes\n", ESP.getFreeHeap());
+}
+
+// ========== AUDIO PLAYBACK ==========
+void playAudioFile(const char* filename) {
+  Serial.printf("🔊 Playing: %s\n", filename);
+  
+  File audioFile = SD.open(filename, FILE_READ);
+  if (!audioFile) {
+    Serial.println("❌ Cannot open audio file!");
+    return;
+  }
+  
+  // Get file size
+  size_t fileSize = audioFile.size();
+  Serial.printf("📊 Audio file size: %d bytes\n", fileSize);
+  
+  // Skip WAV header (44 bytes)
+  audioFile.seek(44);
+  size_t audioDataSize = fileSize - 44;
+  
+  // Reinitialize I2S for speaker output
+  Serial.print("🔊 Initializing speaker...");
+  i2s.end();  // Stop microphone
+  delay(100);
+  
+  // Configure I2S for MAX98357 (STD mode for playback)
+  i2s.setPins(I2S_SPK_SERIAL_CLOCK, I2S_SPK_LEFT_RIGHT_CLOCK, I2S_SPK_SERIAL_DATA);
+  if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println(" ❌ FAILED!");
+    audioFile.close();
+    return;
+  }
+  Serial.println(" ✅");
+  
+  // Allocate buffer for playback
+  const size_t PLAY_CHUNK_SIZE = 4096;
+  uint8_t* buffer = (uint8_t*)malloc(PLAY_CHUNK_SIZE);
+  
+  if (!buffer) {
+    Serial.println("❌ Memory allocation failed!");
+    audioFile.close();
+    i2s.end();
+    return;
+  }
+  
+  Serial.println("▶️  Playing audio...");
+  size_t totalPlayed = 0;
+  size_t bytesRead;
+  unsigned long playStart = millis();
+  
+  // Play audio in chunks
+  while ((bytesRead = audioFile.read(buffer, PLAY_CHUNK_SIZE)) > 0) {
+    // Write to I2S (this blocks until data is sent)
+    size_t bytesWritten = i2s.write(buffer, bytesRead);
+    totalPlayed += bytesWritten;
+    
+    // Progress indicator every 100KB
+    if (totalPlayed % 102400 == 0) {
+      float progress = (totalPlayed * 100.0) / audioDataSize;
+      Serial.printf("  ▶️  %.1f%% played\n", progress);
+    }
+  }
+  
+  unsigned long playEnd = millis();
+  float playDuration = (playEnd - playStart) / 1000.0;
+  
+  Serial.println("✅ Playback complete!");
+  Serial.printf("⏱️  Duration: %.2f seconds\n", playDuration);
+  Serial.printf("📊 Played: %d bytes\n", totalPlayed);
+  
+  // Cleanup
+  free(buffer);
+  audioFile.close();
+  i2s.end();
+  
+  // Reinitialize I2S for microphone
+  delay(100);
+  Serial.print("🎙️ Re-initializing microphone...");
+  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println(" ❌ FAILED!");
+    systemReady = false;
+  } else {
+    Serial.println(" ✅");
+  }
+  
+  Serial.println();
 }
