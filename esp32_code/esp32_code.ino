@@ -1,398 +1,624 @@
-#include "WiFi.h"
-#include "HTTPClient.h"
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
 #include "ESP_I2S.h"
-#include "SD.h"
-#include "SPI.h"
-#include "Arduino.h"
-#include "Audio.h"
 #include "FS.h"
-// ===========================================
-// WiFi Configuration
-// ===========================================
-const char* ssid = "Ritish";
+#include "SD.h"
+
+using namespace websockets;
+
+// ========== CONFIGURATION ==========
+const char* ssid = "Ritish-laptop";
 const char* password = "07867860";
-const char* serverURL = "http://10.21.192.72:5000/audioresponse";
+const char* ws_server = "ws://10.51.111.72:5000/upload";
 
-// ===========================================
-// Audio Settings
-// ===========================================
-#define SAMPLE_RATE 16000
-#define RECORD_SECONDS 5
+// Recording settings
+const int SAMPLE_RATE = 16000;
+const int TOUCH_THRESHOLD = 40000;
+const int CHUNK_SIZE = 4096;
 
-// ===========================================
-// SD Card Configuration for XIAO ESP32S3
-// ===========================================
-#define SD_CS          21
-#define SPI_MOSI       9
-#define SPI_MISO       8
-#define SPI_SCK        7
-#define I2S_DOUT      1
-#define I2S_BCLK      4
-#define I2S_LRC       5
-// Create an instance of the I2SClass
+// OPTIMIZATION: Increased upload chunk size for faster transfer
+const int UPLOAD_CHUNK_SIZE = 32768;  // 32KB chunks (was 8KB)
+
+// Connection settings - OPTIMIZED timeouts
+const int MAX_RECONNECT_ATTEMPTS = 2;  // Reduced for faster failure
+const int RECONNECT_DELAY_MS = 1000;   // Reduced delay
+const int WS_TIMEOUT_MS = 45000;       // Reduced to 45s
+const int UPLOAD_TIMEOUT_MS = 30000;   // Reduced to 30s
+
+// I2S pins
+const int I2S_MIC_SERIAL_CLOCK = 42;
+const int I2S_MIC_LEFT_RIGHT_CLOCK = 41;
+const int I2S_SPK_SERIAL_DATA = 3;
+const int I2S_SPK_LEFT_RIGHT_CLOCK = 5;
+const int I2S_SPK_SERIAL_CLOCK = 4;
+
 I2SClass i2s;
-bool micReady = false;
-bool sdReady = false;
+WebsocketsClient wsClient;
+bool uploadComplete = false;
+bool systemReady = false;
+File downloadFile;
+size_t expectedDownloadSize = 0;
+size_t downloadedBytes = 0;
+bool receivingAudio = false;
+unsigned long lastActivityTime = 0;
 
-Audio audio;
-// Global buffer for audio data
-uint8_t* audioBuffer = nullptr;
-size_t audioBufferSize = 0;
+// OPTIMIZATION: Buffer for faster downloads
+uint8_t* downloadBuffer = nullptr;
+const size_t DOWNLOAD_BUFFER_SIZE = 32768;  // 32KB buffer
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) {
-    delay(10);
-  }
-  
-  delay(2000);
-  
-  Serial.println();
-  Serial.println("=== XIAO ESP32S3 Audio Recorder with SD Card ===");
-  Serial.println("Boot successful!");
-  
-  // System info
-  Serial.printf("Chip: %s\n", ESP.getChipModel());
-  Serial.printf("Free Heap: %d\n", ESP.getFreeHeap());
-  Serial.printf("Free PSRAM: %d\n", ESP.getFreePsram());
-  
-  // Connect WiFi
-  Serial.println("\nConnecting to WiFi...");
-  connectWiFi();
-  
-  // Initialize internal PDM microphone
-  Serial.println("\nInitializing internal PDM microphone...");
-  setupInternalMicrophone();
-  
-  // Initialize SD Card
-  Serial.println("\nInitializing SD Card...");
-  setupSDCard();
-   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    audio.setVolume(20);
-  Serial.println("\n=== Setup Complete ===");
-  Serial.println("Ready to record audio");
-}
+// ========== FORWARD DECLARATIONS ==========
+void playAudioFile(const char* filename);
+bool ensureWiFiConnected();
+bool connectWebSocket();
+void cleanupWebSocket();
 
-void loop() {
-  Serial.println("\n--- Audio Recording ---");
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
-  // Check WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected, reconnecting...");
-    connectWiFi();
-    delay(2000);
-    return;
-  }
+// ========== CALLBACKS ==========
+void onMessageCallback(WebsocketsMessage message) {
+  lastActivityTime = millis();
   
-  // Check SD Card
-  if (!sdReady) {
-    Serial.println("SD Card not ready, retrying...");
-    setupSDCard();
-    delay(2000);
-  }
-  
-  // Check microphone
-  if (!micReady) {
-    Serial.println("Microphone not ready, retrying...");
-    setupInternalMicrophone();
-    delay(2000);
-  }
-  
-  if (!micReady || !sdReady) {
-    Serial.println("Waiting for all components to be ready...");
-    delay(5000);
-    return;
-  }
-  
-  // Record audio from internal microphone
-  Serial.println("Recording from internal PDM microphone...");
-  if (recordFromInternalMic()) {
-    Serial.println("✓ Audio recorded successfully to buffer");
+  if (message.isText()) {
+    String msg = message.data();
     
-    // Upload audio to server and get response
-    if (uploadAudioWithResponse()) {
-      Serial.println("✓ Upload successful and response saved!");
-    } else {
-      Serial.println("✗ Upload failed or no response received");
+    // Check for error messages
+    if (msg.indexOf("\"status\":\"error\"") >= 0) {
+      Serial.println("❌ Server error");
+      uploadComplete = true;
+      return;
     }
-  audio.connecttoFS(SD, "response.mp3");
-  audio.loop();
-  while(audio.isRunning());
-    // Free audio buffer after upload
-    if (audioBuffer) {
-      free(audioBuffer);
-      audioBuffer = nullptr;
-      audioBufferSize = 0;
+    
+    // Check if server is sending audio back
+    if (msg.indexOf("\"audio_size\":") >= 0) {
+      int sizeStart = msg.indexOf("\"audio_size\":") + 13;
+      int sizeEnd = msg.indexOf(",", sizeStart);
+      if (sizeEnd < 0) sizeEnd = msg.indexOf("}", sizeStart);
+      
+      String sizeStr = msg.substring(sizeStart, sizeEnd);
+      expectedDownloadSize = sizeStr.toInt();
+      
+      Serial.printf("📥 Receiving response: %d KB\n", expectedDownloadSize/1024);
+      
+      // Close any existing file
+      if (downloadFile) {
+        downloadFile.close();
+      }
+      
+      // Delete old response file if exists
+      if (SD.exists("/response.wav")) {
+        SD.remove("/response.wav");
+      }
+      
+      // OPTIMIZATION: Allocate download buffer
+      if (!downloadBuffer) {
+        downloadBuffer = (uint8_t*)malloc(DOWNLOAD_BUFFER_SIZE);
+      }
+      
+      // Open file for writing
+      downloadFile = SD.open("/response.wav", FILE_WRITE);
+      if (downloadFile) {
+        receivingAudio = true;
+        downloadedBytes = 0;
+      } else {
+        Serial.println("❌ SD write failed");
+        uploadComplete = true;
+      }
+    } else if (msg.indexOf("\"sending_audio\":false") >= 0) {
+      uploadComplete = true;
     }
-  } else {
-    Serial.println("✗ Audio recording failed");
+  } 
+  else if (message.isBinary() && receivingAudio) {
+    size_t dataSize = message.length();
+    
+    if (downloadFile && dataSize > 0) {
+      // OPTIMIZATION: Direct write without buffering
+      size_t written = downloadFile.write((uint8_t*)message.c_str(), dataSize);
+      downloadedBytes += written;
+      
+      // OPTIMIZATION: Batch flush every 64KB for better performance
+      if (downloadedBytes % 65536 == 0) {
+        downloadFile.flush();
+      }
+      
+      // Check if download complete
+      if (downloadedBytes >= expectedDownloadSize) {
+        downloadFile.flush();
+        downloadFile.close();
+        receivingAudio = false;
+        uploadComplete = true;
+        
+        Serial.println("✅ Download complete");
+        
+        // Verify file on SD card
+        File verifyFile = SD.open("/response.wav", FILE_READ);
+        if (verifyFile) {
+          size_t actualSize = verifyFile.size();
+          verifyFile.close();
+          
+          if (actualSize >= expectedDownloadSize) {
+            Serial.print("size recieved=");
+            Serial.println(actualSize/1024);
+            Serial.println("▶️  Playing response...\n");
+            delay(300);  // OPTIMIZATION: Reduced delay
+            playAudioFile("/response.wav");
+          }
+        }
+      }
+    }
   }
-  
-  Serial.println("Waiting 15 seconds before next recording...");
-  delay(15000);
 }
 
-void connectWiFi() {
-  Serial.print("Connecting to: ");
-  Serial.println(ssid);
+void onEventsCallback(WebsocketsEvent event, String data) {
+  if (event == WebsocketsEvent::ConnectionClosed) {
+    if (receivingAudio && downloadFile) {
+      downloadFile.flush();
+      downloadFile.close();
+      receivingAudio = false;
+    }
+    uploadComplete = true;
+  }
+  else if (event == WebsocketsEvent::GotPing || event == WebsocketsEvent::GotPong) {
+    lastActivityTime = millis();
+  }
+}
+
+// ========== WiFi MANAGEMENT ==========
+bool ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
   
-  WiFi.mode(WIFI_STA);
+  Serial.println("⚠️ WiFi reconnecting...");
+  WiFi.disconnect();
+  delay(100);
   WiFi.begin(ssid, password);
   
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {  // Reduced attempts
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✅ WiFi OK");
+    return true;
+  }
+  
+  Serial.println("❌ WiFi failed");
+  return false;
+}
+
+// ========== WebSocket MANAGEMENT ==========
+bool connectWebSocket() {
+  if (!ensureWiFiConnected()) {
+    return false;
+  }
+  
+  wsClient.onMessage(onMessageCallback);
+  wsClient.onEvent(onEventsCallback);
+  
+  for (int attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+    Serial.printf("🔗 Connecting... (%d/%d)\n", attempt, MAX_RECONNECT_ATTEMPTS);
+    
+    if (wsClient.connect(ws_server)) {
+      Serial.println("✅ Connected");
+      lastActivityTime = millis();
+      return true;
+    }
+    
+    if (attempt < MAX_RECONNECT_ATTEMPTS) {
+      delay(RECONNECT_DELAY_MS);
+    }
+  }
+  
+  return false;
+}
+
+void cleanupWebSocket() {
+  if (wsClient.available()) {
+    wsClient.close();
+  }
+  
+  if (receivingAudio && downloadFile) {
+    downloadFile.flush();
+    downloadFile.close();
+    receivingAudio = false;
+  }
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // Reduced delay
+  
+  Serial.println("\n🎤 Audio Recorder (OPTIMIZED)");
+  Serial.println("==============================\n");
+
+  // === Touch sensor ===
+  touchAttachInterrupt(T1, [](){}, TOUCH_THRESHOLD);
+
+  // === SD Card ===
+  Serial.print("💾 SD Card...");
+  if (!SD.begin(21)) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
+  }
+  Serial.println(" ✅");
+  
+  if (SD.exists("/response.wav")) {
+    SD.remove("/response.wav");
+  }
+
+  // === Microphone ===
+  Serial.print("🎙️ Microphone...");
+  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
+  }
+  Serial.println(" ✅");
+
+  // === WiFi ===
+  Serial.print("📡 WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {  // Reduced attempts
     delay(500);
     Serial.print(".");
     attempts++;
   }
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println();
-    Serial.printf("✓ WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("Signal: %d dBm\n", WiFi.RSSI());
-  } else {
-    Serial.println();
-    Serial.println("✗ WiFi connection failed!");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(" ❌");
+    while(1) delay(1000);
   }
+  
+  Serial.println(" ✅");
+  Serial.printf("   %s (%d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  
+  systemReady = true;
+  Serial.println("\n✅ Ready! Touch T2 to record\n");
 }
 
-void setupSDCard() {
-  Serial.println("Configuring SD Card SPI...");
-  
-  // Initialize SPI with correct pins for XIAO ESP32S3
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
-  
-  Serial.printf("SPI Pins - SCK:%d, MISO:%d, MOSI:%d, CS:%d\n", SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
-  
-  // Try to mount SD card
-  if (!SD.begin(SD_CS)) {
-    Serial.println("✗ SD Card initialization failed!");
-    Serial.println("Please check:");
-    Serial.println("  - SD card is inserted");
-    Serial.println("  - SD card is formatted (FAT32)");
-    Serial.println("  - Wiring is correct");
-    sdReady = false;
+// ========== LOOP ==========
+void loop() {
+  if (!systemReady) {
+    delay(1000);
     return;
   }
   
-  uint8_t cardType = SD.cardType();
-  
-  if (cardType == CARD_NONE) {
-    Serial.println("✗ No SD card detected!");
-    sdReady = false;
-    return;
+  // OPTIMIZATION: Less frequent WiFi checks
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 10000) {  // Check every 10s instead of 5s
+    if (WiFi.status() != WL_CONNECTED) {
+      ensureWiFiConnected();
+    }
+    lastWiFiCheck = millis();
   }
   
-  Serial.print("✓ SD Card Type: ");
-  if (cardType == CARD_MMC) {
-    Serial.println("MMC");
-  } else if (cardType == CARD_SD) {
-    Serial.println("SDSC");
-  } else if (cardType == CARD_SDHC) {
-    Serial.println("SDHC");
-  } else {
-    Serial.println("UNKNOWN");
-  }
+  int touchValue = touchRead(T2);
   
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-  Serial.printf("SD Card Size: %llu MB\n", cardSize);
-  Serial.printf("Total space: %llu MB\n", SD.totalBytes() / (1024 * 1024));
-  Serial.printf("Used space: %llu MB\n", SD.usedBytes() / (1024 * 1024));
-  
-  sdReady = true;
-  Serial.println("✓ SD Card ready");
-}
-
-void setupInternalMicrophone() {
-  Serial.println("Initializing I2S bus...");
-  
-  // Set up PDM microphone pins (XIAO ESP32S3 internal mic)
-  i2s.setPinsPdmRx(42, 41);
-  
-  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
-    Serial.println("✗ Failed to initialize I2S!");
-    micReady = false;
-    return;
-  }
-  
-  micReady = true;
-  Serial.println("✓ I2S bus initialized");
-  Serial.printf("Sample rate: %d Hz\n", SAMPLE_RATE);
-}
-
-bool recordFromInternalMic() {
-  Serial.printf("Recording %d seconds of audio data...\n", RECORD_SECONDS);
-  
-  // Free previous buffer if exists
-  if (audioBuffer) {
-    free(audioBuffer);
-    audioBuffer = nullptr;
-    audioBufferSize = 0;
-  }
-  
-  // Record audio using the ESP_I2S library's recordWAV function
-  // This automatically records in WAV format with proper headers
-  audioBuffer = i2s.recordWAV(RECORD_SECONDS, &audioBufferSize);
-  
-  if (audioBuffer == nullptr || audioBufferSize == 0) {
-    Serial.println("Failed to record audio data!");
-    return false;
-  }
-  
-  Serial.printf("Recorded %d bytes of WAV audio data in buffer\n", audioBufferSize);
-  Serial.println("✓ Audio stored in memory buffer");
-  
-  // Verify WAV header (first 4 bytes should be "RIFF")
-  if (audioBuffer[0] == 'R' && audioBuffer[1] == 'I' && audioBuffer[2] == 'F' && audioBuffer[3] == 'F') {
-    Serial.println("✓ Valid WAV file header detected in buffer");
-  } else {
-    Serial.println("⚠ Warning: WAV header not detected, but proceeding anyway");
-  }
-  
-  return true;
-}
-
-bool uploadAudioWithResponse() {
-  // Check if audio buffer exists
-  if (!audioBuffer || audioBufferSize == 0) {
-    Serial.println("No audio data in buffer!");
-    return false;
-  }
-  
-  Serial.printf("Audio buffer size: %d bytes (%.2f KB)\n", audioBufferSize, audioBufferSize / 1024.0);
-  
-  // Create HTTP request
-  HTTPClient http;
-  http.begin(serverURL);
-  http.setTimeout(60000);  // 30 second timeout to wait for server response
-  
-  String boundary = "XiaoInternalMicBoundary";
-  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-  
-  // Build multipart form data (audio only)
-  String audioHeader = "--" + boundary + "\r\n";
-  audioHeader += "Content-Disposition: form-data; name=\"audio\"; filename=\"internal_mic.wav\"\r\n";
-  audioHeader += "Content-Type: audio/wav\r\n\r\n";
-  
-  String footer = "\r\n--" + boundary + "--\r\n";
-  
-  Serial.printf("Uploading WAV audio: internal_mic.wav (%d bytes)\n", audioBufferSize);
-  
-  // Calculate payload size
-  size_t totalSize = audioHeader.length() + audioBufferSize + footer.length();
-  Serial.printf("Total upload size: %d bytes (%.2f KB)\n", totalSize, totalSize / 1024.0);
-  
-  // Create payload
-  uint8_t* payload = (uint8_t*)malloc(totalSize);
-  if (!payload) {
-    Serial.println("✗ Failed to allocate upload payload");
-    http.end();
-    return false;
-  }
-  
-  // Assemble payload
-  size_t pos = 0;
-  
-  // Add audio header
-  memcpy(payload + pos, audioHeader.c_str(), audioHeader.length());
-  pos += audioHeader.length();
-  
-  // Add audio data from buffer
-  memcpy(payload + pos, audioBuffer, audioBufferSize);
-  pos += audioBufferSize;
-  
-  // Add footer
-  memcpy(payload + pos, footer.c_str(), footer.length());
-  
-  Serial.println("Uploading audio to server...");
-  Serial.println("Waiting up to 30 seconds for server response...");
-  
-  // Send POST request
-  int httpCode = http.POST(payload, totalSize);
-  
-  // Free payload as we don't need it anymore
-  free(payload);
-  
-  // Handle response
-  bool success = false;
-  if (httpCode > 0) {
-    Serial.printf("HTTP Response: %d\n", httpCode);
+  if (touchValue > TOUCH_THRESHOLD) {
+    Serial.println("🎙️ Recording...");
     
-    if (httpCode == 200) {
-      Serial.println("✓ Server accepted the audio!");
-      
-      // Check if response contains audio data
-      int contentLength = http.getSize();
-      Serial.printf("Response content length: %d bytes\n", contentLength);
-      
-      if (contentLength > 0) {
-        // Get response stream
-        WiFiClient* stream = http.getStreamPtr();
+    unsigned long recordStart = millis();
+    
+    if (SD.exists("/recording.wav")) {
+      SD.remove("/recording.wav");
+    }
+    
+    File file = SD.open("/recording.wav", FILE_WRITE);
+    
+    if (!file) {
+      Serial.println("❌ File open failed");
+      delay(1000);
+      return;
+    }
+
+    uint8_t wavHeader[44];
+    writeWAVHeader(wavHeader, 0, SAMPLE_RATE);
+    file.write(wavHeader, 44);
+    
+    size_t totalBytes = 0;
+    uint8_t buffer[CHUNK_SIZE];
+    
+    while (touchRead(T2) > TOUCH_THRESHOLD) {
+      size_t bytesRead = i2s.readBytes((char*)buffer, CHUNK_SIZE);
+      if (bytesRead > 0) {
+        file.write(buffer, bytesRead);
+        totalBytes += bytesRead;
         
-        // Generate unique filename with timestamp
-        String filename = "/response.mp3";
-        
-        Serial.printf("Saving server response to SD card: %s\n", filename.c_str());
-        
-        // Open file on SD card for writing
-        File responseFile = SD.open(filename.c_str(), FILE_WRITE);
-        if (!responseFile) {
-          Serial.println("✗ Failed to create response file on SD card");
-        } else {
-          // Read response data and write to SD card
-          uint8_t buffer[512];
-          int totalBytes = 0;
-          
-          while (http.connected() && (contentLength > 0 || contentLength == -1)) {
-            size_t availableBytes = stream->available();
-            
-            if (availableBytes) {
-              int bytesToRead = ((availableBytes > sizeof(buffer)) ? sizeof(buffer) : availableBytes);
-              int bytesRead = stream->readBytes(buffer, bytesToRead);
-              
-              if (bytesRead > 0) {
-                responseFile.write(buffer, bytesRead);
-                totalBytes += bytesRead;
-                
-                if (contentLength > 0) {
-                  contentLength -= bytesRead;
-                }
-              }
-            }
-            delay(1);
-          }
-          
-          responseFile.close();
-          Serial.printf("✓ Response saved: %d bytes written to %s\n", totalBytes, filename.c_str());
-          
-          // Verify the file
-          if (SD.exists(filename.c_str())) {
-            File checkFile = SD.open(filename.c_str(), FILE_READ);
-            Serial.printf("✓ File verified on SD card, size: %d bytes\n", checkFile.size());
-            checkFile.close();
-            success = true;
-          } else {
-            Serial.println("✗ File verification failed!");
-          }
+        // OPTIMIZATION: Batch flush every 32KB
+        if (totalBytes % 32768 == 0) {
+          file.flush();
         }
-      } else {
-        Serial.println("⚠ Server returned empty response (no audio file)");
-        success = true;  // Still consider upload successful
       }
+      yield();
+    }
+    
+    float recordDuration = (millis() - recordStart) / 1000.0;
+    
+    file.seek(0);
+    writeWAVHeader(wavHeader, totalBytes, SAMPLE_RATE);
+    file.write(wavHeader, 44);
+    file.flush();
+    file.close();
+    
+    Serial.printf("✅ Recorded: %.1fs, %d KB\n", recordDuration, totalBytes/1024);
+    
+    if (totalBytes > 1000) {
+      uploadRecordingReliable(totalBytes + 44);
     } else {
-      Serial.println("✗ Server returned error");
-      String response = http.getString();
-      if (response.length() > 0 && response.length() < 400) {
-        Serial.println("Server response:");
-        Serial.println(response);
+      Serial.println("⚠️ Too short\n");
+    }
+    
+    Serial.println("Ready\n");
+    delay(500);
+  }
+  
+  delay(50);
+}
+
+// ========== HELPER FUNCTIONS ==========
+void writeWAVHeader(uint8_t* header, uint32_t dataSize, uint32_t sampleRate) {
+  uint32_t fileSize = dataSize + 36;
+  uint16_t bitsPerSample = 16;
+  uint16_t numChannels = 1;
+  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  uint16_t blockAlign = numChannels * bitsPerSample / 8;
+  
+  memcpy(header + 0, "RIFF", 4);
+  memcpy(header + 4, &fileSize, 4);
+  memcpy(header + 8, "WAVE", 4);
+  memcpy(header + 12, "fmt ", 4);
+  uint32_t fmtSize = 16;
+  memcpy(header + 16, &fmtSize, 4);
+  uint16_t audioFormat = 1;
+  memcpy(header + 20, &audioFormat, 2);
+  memcpy(header + 22, &numChannels, 2);
+  memcpy(header + 24, &sampleRate, 4);
+  memcpy(header + 28, &byteRate, 4);
+  memcpy(header + 32, &blockAlign, 2);
+  memcpy(header + 34, &bitsPerSample, 2);
+  memcpy(header + 36, "data", 4);
+  memcpy(header + 40, &dataSize, 4);
+}
+
+// ========== OPTIMIZED UPLOAD WITH RELIABILITY ==========
+void uploadRecordingReliable(size_t fileSize) {
+  Serial.printf("📤 Uploading: %d KB\n", fileSize/1024);
+  
+  if (fileSize > 5000000) {
+    Serial.println("❌ File too large");
+    return;
+  }
+  
+  uploadComplete = false;
+  receivingAudio = false;
+  downloadedBytes = 0;
+  
+  if (!connectWebSocket()) {
+    Serial.println("❌ Connection failed");
+    return;
+  }
+  
+  delay(200);  // CRITICAL: Give server time to be ready
+  
+  String sizeMsg = String(fileSize);
+  if (!wsClient.send(sizeMsg)) {
+    Serial.println("❌ Send size failed");
+    cleanupWebSocket();
+    return;
+  }
+  
+  Serial.println("✅ Size sent, waiting for server...");
+  delay(100);  // Let server process size message
+
+  File audioFile = SD.open("/recording.wav", FILE_READ);
+  if (!audioFile) {
+    Serial.println("❌ File open failed");
+    cleanupWebSocket();
+    return;
+  }
+
+  // CRITICAL: Use smaller chunk size for reliability
+  const int RELIABLE_CHUNK_SIZE = 4096;  // 4KB chunks work better
+  uint8_t* buffer = (uint8_t*)malloc(RELIABLE_CHUNK_SIZE);
+  
+  if (!buffer) {
+    Serial.println("❌ Memory allocation failed");
+    audioFile.close();
+    cleanupWebSocket();
+    return;
+  }
+
+  unsigned long sendStart = millis();
+  size_t totalSent = 0;
+  size_t bytesRead;
+  int chunkCount = 0;
+  int consecutiveFails = 0;
+  const int MAX_CONSECUTIVE_FAILS = 5;
+  
+  Serial.println("📤 Sending chunks...");
+  
+  while ((bytesRead = audioFile.read(buffer, RELIABLE_CHUNK_SIZE)) > 0) {
+    // Check WiFi every 10 chunks
+    if (chunkCount % 10 == 0) {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("⚠️ WiFi lost during upload");
+        if (!ensureWiFiConnected()) {
+          Serial.println("❌ WiFi reconnect failed");
+          break;
+        }
+        // Reconnect WebSocket too
+        if (!wsClient.available()) {
+          Serial.println("❌ WebSocket lost");
+          break;
+        }
       }
     }
-  } else {
-    Serial.printf("✗ HTTP Error: %d - %s\n", httpCode, http.errorToString(httpCode).c_str());
-    Serial.println("Check server connection");
+    
+    // Send chunk with retry
+    bool sent = false;
+    for (int retry = 0; retry < 3; retry++) {
+      sent = wsClient.sendBinary((const char*)buffer, bytesRead);
+      if (sent) break;
+      delay(50);
+    }
+    
+    if (!sent) {
+      consecutiveFails++;
+      Serial.printf("❌ Chunk %d failed (%d consecutive fails)\n", chunkCount, consecutiveFails);
+      
+      if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+        Serial.println("❌ Too many consecutive failures");
+        break;
+      }
+      delay(100);
+      continue;
+    }
+    
+    consecutiveFails = 0;
+    totalSent += bytesRead;
+    chunkCount++;
+    
+    // Progress indicator every 20KB
+    if (totalSent % 20480 == 0) {
+      Serial.printf("  %d KB / %d KB\n", totalSent/1024, fileSize/1024);
+    }
+    
+    // CRITICAL: Poll WebSocket to handle incoming messages
+    wsClient.poll();
+    
+    // Small delay for network stability
+    delay(5);
+    
+    // Timeout check
+    if (millis() - sendStart > UPLOAD_TIMEOUT_MS) {
+      Serial.println("❌ Upload timeout");
+      break;
+    }
   }
   
-  http.end();
- 
-  return success;
+  audioFile.close();
+  
+  if (totalSent == fileSize) {
+    float uploadTime = (millis() - sendStart) / 1000.0;
+    Serial.printf("✅ Upload complete: %d KB in %.1fs (%.1f KB/s)\n", 
+                  totalSent/1024, uploadTime, (totalSent/1024)/uploadTime);
+    
+    // Send EOF marker
+    delay(100);
+    wsClient.send("EOF");
+    Serial.println("✅ EOF sent");
+    
+    // Wait for server response
+    Serial.print("⏳ Waiting for response");
+    unsigned long waitStart = millis();
+    lastActivityTime = millis();
+    
+    int dots = 0;
+    while (!uploadComplete && (millis() - waitStart < WS_TIMEOUT_MS)) {
+      wsClient.poll();
+      
+      // Progress dots
+      if ((millis() - waitStart) % 1000 < 50 && dots < 30) {
+        Serial.print(".");
+        dots++;
+      }
+      
+      // Activity timeout (no messages from server)
+      if (millis() - lastActivityTime > 15000) {
+        Serial.println("\n⚠️ Server not responding");
+        break;
+      }
+      
+      delay(50);
+    }
+    
+    Serial.println();
+    
+    if (uploadComplete) {
+      Serial.println("✅ Transaction complete\n");
+    } else {
+      Serial.println("⚠️ No response received\n");
+    }
+  } else {
+    Serial.printf("❌ Upload incomplete: %d/%d KB (%.1f%%)\n", 
+                  totalSent/1024, fileSize/1024, (totalSent*100.0)/fileSize);
+  }
+
+  free(buffer);
+  cleanupWebSocket();
+}
+
+// ========== AUDIO PLAYBACK ==========
+void playAudioFile(const char* filename) {
+  Serial.println("🔊 Playing...");
+  
+  File audioFile = SD.open(filename, FILE_READ);
+  if (!audioFile) {
+    Serial.println("❌ File not found");
+    return;
+  }
+  
+  size_t fileSize = audioFile.size();
+  
+  if (fileSize < 44) {
+    Serial.println("❌ Invalid file");
+    audioFile.close();
+    return;
+  }
+  
+  audioFile.seek(44);
+  size_t audioDataSize = fileSize - 44;
+  
+  i2s.end();
+  delay(100);
+  
+  i2s.setPins(I2S_SPK_SERIAL_CLOCK, I2S_SPK_LEFT_RIGHT_CLOCK, I2S_SPK_SERIAL_DATA);
+  if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("❌ Speaker init failed");
+    audioFile.close();
+    return;
+  }
+  
+  // OPTIMIZATION: Larger playback buffer
+  const size_t PLAY_CHUNK_SIZE = 8192;  // Increased from 4096
+  uint8_t* buffer = (uint8_t*)malloc(PLAY_CHUNK_SIZE);
+  
+  if (!buffer) {
+    Serial.println("❌ Memory failed");
+    audioFile.close();
+    i2s.end();
+    return;
+  }
+  
+  size_t totalPlayed = 0;
+  size_t bytesRead;
+  
+  while ((bytesRead = audioFile.read(buffer, PLAY_CHUNK_SIZE)) > 0) {
+    i2s.write(buffer, bytesRead);
+    totalPlayed += bytesRead;
+  }
+  
+  Serial.println("✅ Playback done");
+  
+  free(buffer);
+  audioFile.close();
+  i2s.end();
+  
+  delay(100);
+  i2s.setPinsPdmRx(I2S_MIC_SERIAL_CLOCK, I2S_MIC_LEFT_RIGHT_CLOCK);
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("❌ Mic reinit failed");
+    systemReady = false;
+  }
+  
+  Serial.println();
 }

@@ -1,20 +1,16 @@
-import pyttsx3
+from gtts import gTTS
+from pydub import AudioSegment
 
-tts_model = pyttsx3.init()
+text = "Hello Ritish, this is a test using gTTS!"
 
-# List all voices
-voices = tts_model.getProperty('voices')
-#Set the voice id ( 0 for male and 1 for female) 
-tts_model.setProperty('voice', voices[0])
-#Set voice speed
-tts_model.setProperty('rate', 200) 
-# Set volume (0.0 to 1.0)
-tts_model.setProperty('volume', 0.9)
 print ("TTS setup is done ✅")
 
 def text_to_speech(text,response_audio_path):
-  tts_model.save_to_file(text, response_audio_path)
-  tts_model.runAndWait()
-  print("doen tts")
+  tts = gTTS(text=text, lang='hi',slow=False)
+  tts.save("output.mp3")
+  sound = AudioSegment.from_mp3("output.mp3")
+  sound = sound.set_frame_rate(16000).set_sample_width(2)
+  sound.export(response_audio_path, format="wav")
+
   return 
    
