@@ -8,7 +8,7 @@ app = Flask(__name__)
 sock = Sock(app)
 
 UPLOAD_FOLDER = "uploads"
-RESPONSE_AUDIO = r"C:\Users\RITISH\OneDrive\Desktop\projects\iot_aiglasses\uploads\audio_1762034697.wav"  # Path to audio file to send back
+RESPONSE_AUDIO = r"C:\Users\RITISH\OneDrive\Desktop\projects\iot_aiglasses\file_example_WAV_2MG.wav"  # Path to audio file to send back
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
