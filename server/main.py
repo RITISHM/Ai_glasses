@@ -15,16 +15,20 @@ app = Flask(__name__)
 sock = Sock(app)
 
 UPLOAD_FOLDER = "uploads"
-RESPONSE_folder = os.path.join(UPLOAD_FOLDER, "response")
+AUDIO_FOLDER = os.path.join(UPLOAD_FOLDER, "audio")
+IMAGE_FOLDER = os.path.join(UPLOAD_FOLDER, "images")
+RESPONSE_FOLDER = os.path.join(UPLOAD_FOLDER, "response")
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(AUDIO_FOLDER, exist_ok=True)
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+os.makedirs(RESPONSE_FOLDER, exist_ok=True)
 
 # Lock for thread safety
 upload_lock = Lock()
 
 # OPTIMIZATION: Increased chunk sizes for faster transfer
-RECEIVE_CHUNK_SIZE = 32768  # 32KB chunks instead of default
-SEND_CHUNK_SIZE = 32768     # 32KB chunks for sending
+RECEIVE_CHUNK_SIZE = 32768  # 32KB chunks
+SEND_CHUNK_SIZE = 32768     # 32KB chunks
 
 def send_error_response(ws, message):
     """Send error response to client"""
@@ -39,12 +43,21 @@ def verify_wav_header(data):
     if len(data) < 44:
         return False
     
-    # Check RIFF header
     if data[0:4] != b'RIFF':
         return False
     
-    # Check WAVE format
     if data[8:12] != b'WAVE':
+        return False
+    
+    return True
+
+def verify_jpeg_header(data):
+    """Verify if data starts with valid JPEG header"""
+    if len(data) < 2:
+        return False
+    
+    # JPEG starts with FF D8
+    if data[0:2] != b'\xff\xd8':
         return False
     
     return True
@@ -58,183 +71,222 @@ def upload(ws):
     with upload_lock:
         chunks = []
         total_received = 0
-        expected_size = 0
-        filename = None
+        expected_image_size = 0
+        expected_audio_size = 0
+        image_filename = None
+        audio_filename = None
         
         try:
-            # ===== RECEIVE FILE SIZE =====
-            size_msg = ws.receive(timeout=10)  # Increased timeout
+            # ===== RECEIVE METADATA (image_size,audio_size) =====
+            metadata_msg = ws.receive(timeout=10)
             
-            if not size_msg:
-                print("❌ No size received")
-                send_error_response(ws, "No size received")
+            if not metadata_msg:
+                print("❌ No metadata received")
+                send_error_response(ws, "No metadata received")
                 return
             
             try:
-                expected_size = int(size_msg)
-                print(f"📥 Expecting: {expected_size/1024:.1f} KB")
+                parts = metadata_msg.split(',')
+                if len(parts) != 2:
+                    raise ValueError("Invalid metadata format")
                 
-                if expected_size <= 0 or expected_size > 10000000:
-                    print(f"❌ Invalid size: {expected_size}")
-                    send_error_response(ws, "Invalid file size")
+                expected_image_size = int(parts[0])
+                expected_audio_size = int(parts[1])
+                
+                print(f"📦 Expecting: Image={expected_image_size/1024:.1f} KB, Audio={expected_audio_size/1024:.1f} KB")
+                
+                if expected_audio_size <= 0 or expected_audio_size > 10000000:
+                    print(f"❌ Invalid audio size: {expected_audio_size}")
+                    send_error_response(ws, "Invalid audio size")
                     return
                     
-            except ValueError as e:
-                print(f"❌ Invalid size format: {size_msg}")
-                send_error_response(ws, "Invalid size format")
+            except (ValueError, IndexError) as e:
+                print(f"❌ Invalid metadata format: {metadata_msg}")
+                send_error_response(ws, "Invalid metadata format")
                 return
             
-            # ===== RECEIVE AUDIO CHUNKS =====
-            print(f'📥 Receiving audio chunks...')
-            t_start = time.time()
-            chunk_count = 0
-            timeout_occurred = False
-            last_chunk_time = time.time()
+            # ===== RECEIVE IMAGE (if size > 0) =====
+            image_data = None
+            if expected_image_size > 0:
+                print(f'📥 Receiving image...')
+                t_image_start = time.time()
+                
+                image_chunks = []
+                image_received = 0
+                
+                time.sleep(0.1)
+                
+                while image_received < expected_image_size:
+                    try:
+                        chunk_timeout = 10
+                        data = ws.receive(timeout=chunk_timeout)
+                        
+                        if data is None:
+                            print(f"⚠️ Image receive timeout")
+                            break
+                        
+                        if isinstance(data, str):
+                            print(f"⚠️ Unexpected text during image: {data[:50]}")
+                            continue
+                        
+                        if isinstance(data, bytes) and len(data) > 0:
+                            image_chunks.append(data)
+                            image_received += len(data)
+                            
+                            if image_received >= expected_image_size:
+                                break
+                    
+                    except Exception as e:
+                        print(f"⚠️ Image receive error: {e}")
+                        break
+                
+                if image_chunks:
+                    image_data = b''.join(image_chunks)
+                    image_time = time.time() - t_image_start
+                    print(f"📦 Image received: {len(image_data)/1024:.1f} KB in {image_time:.1f}s")
+                    
+                    if not verify_jpeg_header(image_data):
+                        print("⚠️ Invalid JPEG header")
+                    else:
+                        print("✅ Valid JPEG detected")
             
-            # CRITICAL: Give client time to start sending
-            time.sleep(0.2)
+            # ===== RECEIVE AUDIO =====
+            print(f'📥 Receiving audio...')
+            t_audio_start = time.time()
+            
+            audio_chunks = []
+            audio_received = 0
+            chunk_count = 0
+            
+            time.sleep(0.1)
             
             while True:
                 try:
-                    # Calculate dynamic timeout based on:
-                    # - Remaining data
-                    # - Current transfer speed
-                    remaining = expected_size - total_received
+                    remaining = expected_audio_size - audio_received
                     
                     if chunk_count == 0:
-                        # First chunk: be patient
                         chunk_timeout = 15
                     elif remaining > 50000:
-                        # Large amount remaining: standard timeout
                         chunk_timeout = 10
                     elif remaining > 0:
-                        # Near completion: shorter timeout
                         chunk_timeout = 5
                     else:
-                        # Complete
                         break
                     
                     data = ws.receive(timeout=chunk_timeout)
                     
                     if data is None:
-                        elapsed_since_last = time.time() - last_chunk_time
-                        print(f"⚠️ Timeout after {elapsed_since_last:.1f}s (chunk {chunk_count})")
-                        timeout_occurred = True
-                        
-                        # If we got some data and timeout is reasonable, consider it complete
-                        if total_received > 1000 and elapsed_since_last > 8:
-                            print(f"⚠️ Assuming upload complete due to timeout")
+                        print(f"⚠️ Audio timeout after {chunk_count} chunks")
+                        if audio_received > 1000:
                             break
                         else:
                             break
                     
-                    # Check for EOF marker
                     if isinstance(data, str):
                         if data == "EOF":
-                            print(f"✅ EOF received after {chunk_count} chunks")
+                            print(f"✅ EOF received")
                             break
                         else:
-                            print(f"⚠️ Unexpected text message: {data[:50]}")
                             continue
                     
-                    # Process binary data
                     if isinstance(data, bytes) and len(data) > 0:
-                        chunks.append(data)
-                        data_len = len(data)
-                        total_received += data_len
+                        audio_chunks.append(data)
+                        audio_received += len(data)
                         chunk_count += 1
-                        last_chunk_time = time.time()
                         
-                        # Progress update every 10 chunks
                         if chunk_count % 10 == 0:
-                            progress = (total_received / expected_size) * 100
-                            print(f"  📦 Chunk {chunk_count}: {total_received/1024:.1f} KB / {expected_size/1024:.1f} KB ({progress:.1f}%)")
+                            progress = (audio_received / expected_audio_size) * 100
+                            print(f"  📦 Chunk {chunk_count}: {audio_received/1024:.1f} KB / {expected_audio_size/1024:.1f} KB ({progress:.1f}%)")
                         
-                        # Check if complete
-                        if total_received >= expected_size:
-                            print(f"✅ Received expected amount")
+                        if audio_received >= expected_audio_size:
                             break
-                    
+                
                 except Exception as e:
-                    print(f"⚠️ Receive error: {e}")
-                    if total_received > 1000:
-                        # Got substantial data, try to process it
-                        print(f"⚠️ Attempting to process partial data")
+                    print(f"⚠️ Audio receive error: {e}")
+                    if audio_received > 1000:
                         break
                     else:
                         raise
             
-            t_receive = time.time()
-            receive_time = t_receive - t_start
+            audio_time = time.time() - t_audio_start
             
-            # ===== VALIDATE DATA =====
-            if total_received == 0:
-                print("❌ No data received")
-                send_error_response(ws, "No data received")
+            if audio_received == 0:
+                print("❌ No audio data received")
+                send_error_response(ws, "No audio data received")
                 return
             
-            # Combine all chunks
-            full_data = b''.join(chunks)
-            actual_size = len(full_data)
+            audio_data = b''.join(audio_chunks)
+            print(f"📦 Audio received: {len(audio_data)/1024:.1f} KB in {audio_time:.1f}s ({len(audio_data)/audio_time/1024:.1f} KB/s)")
             
-            print(f"📦 Received: {actual_size/1024:.1f} KB in {receive_time:.1f}s ({actual_size/receive_time/1024:.1f} KB/s)")
-            print(f"   Chunks: {chunk_count}, Avg size: {actual_size/chunk_count if chunk_count > 0 else 0:.0f} bytes")
-            
-            # Check size mismatch
-            size_ratio = actual_size / expected_size
-            if size_ratio < 0.95:
-                print(f"⚠️ Size mismatch! Expected {expected_size/1024:.1f}KB, got {actual_size/1024:.1f}KB ({size_ratio*100:.1f}%)")
-                if timeout_occurred:
-                    print(f"   Likely cause: Upload timeout")
-                    
-                # Decide if we should try to process anyway
-                if size_ratio < 0.5:
-                    print(f"❌ Too much data missing, aborting")
-                    send_error_response(ws, f"Incomplete upload: only {size_ratio*100:.1f}% received")
-                    return
-                else:
-                    print(f"⚠️ Attempting to process partial audio...")
-            
-            # Verify WAV format
-            if not verify_wav_header(full_data):
-                print("⚠️ Invalid WAV header - data may be corrupted")
+            if not verify_wav_header(audio_data):
+                print("⚠️ Invalid WAV header")
             else:
                 print("✅ Valid WAV header detected")
-            name=int(time.time())
-            # ===== SAVE FILE =====
-            filename = f"{UPLOAD_FOLDER}/audio/audio_{name}.wav"
             
+            # ===== SAVE FILES =====
+            timestamp = int(time.time())
+            
+            # Save image
+            if image_data and len(image_data) > 0:
+                image_filename = f"{IMAGE_FOLDER}/image_{timestamp}.jpg"
+                try:
+                    with open(image_filename, "wb") as f:
+                        f.write(image_data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    
+                    if os.path.exists(image_filename):
+                        print(f"💾 Image saved: {image_filename} ({os.path.getsize(image_filename)/1024:.1f} KB)")
+                    else:
+                        print(f"⚠️ Image save verification failed")
+                        image_filename = None
+                        
+                except Exception as e:
+                    print(f"❌ Image save error: {e}")
+                    image_filename = None
+            
+            # Save audio
+            audio_filename = f"{AUDIO_FOLDER}/audio_{timestamp}.wav"
             try:
-                with open(filename, "wb") as f:
-                    f.write(full_data)
+                with open(audio_filename, "wb") as f:
+                    f.write(audio_data)
                     f.flush()
                     os.fsync(f.fileno())
                 
-                if os.path.exists(filename):
-                    saved_size = os.path.getsize(filename)
-                    print(f"💾 Saved: {filename} ({saved_size/1024:.1f} KB)")
+                if os.path.exists(audio_filename):
+                    print(f"💾 Audio saved: {audio_filename} ({os.path.getsize(audio_filename)/1024:.1f} KB)")
                 else:
-                    print(f"❌ Save verification failed")
-                    send_error_response(ws, "File save failed")
+                    print(f"❌ Audio save verification failed")
+                    send_error_response(ws, "Audio save failed")
                     return
                     
             except Exception as e:
-                print(f"❌ Save error: {e}")
-                send_error_response(ws, f"File save error: {str(e)}")
+                print(f"❌ Audio save error: {e}")
+                send_error_response(ws, f"Audio save error: {str(e)}")
                 return
             
-            RESPONSE_AUDIO=f"{RESPONSE_folder}/response_{name}.wav"
-            # ===== PROCESS AUDIO =====
-            print(f"🤖 Processing audio...")
+            RESPONSE_AUDIO = f"{RESPONSE_FOLDER}/response_{timestamp}.wav"
+            
+            # ===== PROCESS AUDIO AND IMAGE =====
+            print(f"🤖 Processing audio and image...")
             processing_start = time.time()
             
             try:
-                transcribe = speech_to_text(filename)
+                # Transcribe audio
+                transcribe = speech_to_text(audio_filename)
                 print(f"📝 Transcription: {transcribe[:100]}...")
                 
-                response_text = generate_prompt_response(transcribe)
+                # Generate response with image (if available)
+                if image_filename and os.path.exists(image_filename):
+                    print(f"🖼️ Processing with image context...")
+                    response_text = generate_image_response(image_filename, transcribe)
+                else:
+                    print(f"💬 Processing text only...")
+                    response_text = generate_prompt_response(transcribe)
+                
                 print(f"💬 Response: {response_text[:100]}...")
                 
+                # Convert to speech
                 text_to_speech(response_text, RESPONSE_AUDIO)
                 
                 processing_time = time.time() - processing_start
@@ -252,7 +304,8 @@ def upload(ws):
                 
                 response = {
                     "status": "ok",
-                    "upload_size": actual_size,
+                    "upload_size": len(audio_data),
+                    "image_received": image_filename is not None,
                     "sending_audio": False,
                     "message": "Processing complete but no audio response"
                 }
@@ -265,7 +318,8 @@ def upload(ws):
             # Send metadata
             response = {
                 "status": "ok",
-                "upload_size": actual_size,
+                "upload_size": len(audio_data),
+                "image_received": image_filename is not None,
                 "audio_size": audio_size,
                 "sending_audio": True
             }
@@ -294,12 +348,10 @@ def upload(ws):
                         sent_bytes += len(chunk)
                         send_chunk_count += 1
                         
-                        # Small delay for reliability
                         time.sleep(0.05)
                 
                 send_time = time.time() - send_start
                 print(f"✅ Response sent: {sent_bytes/1024:.1f} KB in {send_time:.1f}s ({sent_bytes/send_time/1024:.1f} KB/s)")
-                print(f"   Sent in {send_chunk_count} chunks")
                 time.sleep(0.7)
                 
             except Exception as e:
@@ -307,9 +359,9 @@ def upload(ws):
                 return
             
             # ===== SUMMARY =====
-            total_time = time.time() - t_start
+            total_time = time.time() - t_audio_start
             print(f"✅ Transaction complete ({total_time:.1f}s total)")
-            print(f"   Upload: {receive_time:.1f}s, Process: {processing_time:.1f}s, Download: {send_time:.1f}s")
+            print(f"   Image: {image_time if image_data else 0:.1f}s, Audio: {audio_time:.1f}s, Process: {processing_time:.1f}s, Send: {send_time:.1f}s")
             print()
             
         except Exception as e:
@@ -326,23 +378,21 @@ def upload(ws):
 
 @app.route('/')
 def index():
-    audio_exists = os.path.exists(RESPONSE_folder)
-    audio_size = os.path.getsize(RESPONSE_folder) if audio_exists else 0
-    
-    upload_count = len([f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.wav')])
+    upload_count = len([f for f in os.listdir(AUDIO_FOLDER) if f.endswith('.wav')]) if os.path.exists(AUDIO_FOLDER) else 0
+    image_count = len([f for f in os.listdir(IMAGE_FOLDER) if f.endswith('.jpg')]) if os.path.exists(IMAGE_FOLDER) else 0
+    response_count = len([f for f in os.listdir(RESPONSE_FOLDER) if f.endswith('.wav')]) if os.path.exists(RESPONSE_FOLDER) else 0
     
     return f'''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Audio WebSocket Server</title>
+        <title>Audio & Image WebSocket Server</title>
         <style>
             body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
             .container {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
             h1 {{ color: #333; }}
             .status {{ padding: 10px; border-radius: 5px; margin: 10px 0; }}
             .ok {{ background: #d4edda; color: #155724; }}
-            .error {{ background: #f8d7da; color: #721c24; }}
             .info {{ background: #d1ecf1; color: #0c5460; }}
             table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
             td {{ padding: 10px; border-bottom: 1px solid #ddd; }}
@@ -351,7 +401,7 @@ def index():
     </head>
     <body>
         <div class="container">
-            <h1>🎤 WebSocket Audio Server (OPTIMIZED)</h1>
+            <h1>🎤📸 Audio & Image WebSocket Server</h1>
             <div class="status ok">
                 <strong>Status:</strong> Running ✅
             </div>
@@ -363,36 +413,45 @@ def index():
                 </tr>
                 <tr>
                     <td>Protocol</td>
-                    <td>Upload → Process → Download</td>
+                    <td>Image + Audio → Process → Response</td>
                 </tr>
                 <tr>
                     <td>Chunk Size</td>
                     <td>{SEND_CHUNK_SIZE/1024:.0f} KB (Optimized)</td>
                 </tr>
                 <tr>
-                    <td>Upload Folder</td>
-                    <td>{os.path.abspath(UPLOAD_FOLDER)}</td>
-                </tr>
-                <tr>
-                    <td>Files Uploaded</td>
+                    <td>Audio Files</td>
                     <td>{upload_count} recordings</td>
                 </tr>
                 <tr>
-                    <td>Response Audio</td>
-                    <td>{'✅ Ready' if audio_exists else '❌ Not Found'}</td>
+                    <td>Image Files</td>
+                    <td>{image_count} images</td>
                 </tr>
-                {f'<tr><td>Response Size</td><td>{audio_size/1024:.2f} KB</td></tr>' if audio_exists else ''}
+                <tr>
+                    <td>Response Files</td>
+                    <td>{response_count} responses</td>
+                </tr>
+                <tr>
+                    <td>Audio Folder</td>
+                    <td>{os.path.abspath(AUDIO_FOLDER)}</td>
+                </tr>
+                <tr>
+                    <td>Image Folder</td>
+                    <td>{os.path.abspath(IMAGE_FOLDER)}</td>
+                </tr>
+                <tr>
+                    <td>Response Folder</td>
+                    <td>{os.path.abspath(RESPONSE_FOLDER)}</td>
+                </tr>
             </table>
             
-            {'' if audio_exists else '<div class="status error">⚠️ Response audio file not found! Place your audio at:<br><code>' + RESPONSE_AUDIO + '</code></div>'}
-            
             <div class="status info">
-                <strong>💡 Optimizations Applied:</strong><br>
-                • 32KB chunk sizes for faster transfer<br>
-                • Pre-allocated buffers for efficient memory usage<br>
-                • Removed artificial delays between chunks<br>
-                • Direct buffer writes (no list concatenation)<br>
-                • Adaptive timeouts based on remaining data
+                <strong>💡 Features:</strong><br>
+                • Captures image from OV2640 camera<br>
+                • Records audio after image capture<br>
+                • Uses image context for AI response generation<br>
+                • Returns audio response to device<br>
+                • 32KB chunk sizes for optimal transfer speed
             </div>
         </div>
     </body>
@@ -405,8 +464,9 @@ def health():
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "uploads_folder": UPLOAD_FOLDER,
-        "response_audio_exists": os.path.exists(RESPONSE_folder),
+        "audio_folder": AUDIO_FOLDER,
+        "image_folder": IMAGE_FOLDER,
+        "response_folder": RESPONSE_FOLDER,
         "optimizations": {
             "receive_chunk_size": RECEIVE_CHUNK_SIZE,
             "send_chunk_size": SEND_CHUNK_SIZE
@@ -415,22 +475,16 @@ def health():
 
 if __name__ == '__main__':
     print("\n" + "=" * 60)
-    print("🚀 WebSocket Audio Server (OPTIMIZED)")
+    print("🚀 Audio & Image WebSocket Server (OPTIMIZED)")
     print("=" * 60)
-    print(f"📁 Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
+    print(f"📁 Audio folder: {os.path.abspath(AUDIO_FOLDER)}")
+    print(f"🖼️  Image folder: {os.path.abspath(IMAGE_FOLDER)}")
+    print(f"📤 Response folder: {os.path.abspath(RESPONSE_FOLDER)}")
     print(f"🌐 WebSocket: ws://0.0.0.0:5000/upload")
     print(f"🌐 Web interface: http://0.0.0.0:5000")
     print(f"🏥 Health check: http://0.0.0.0:5000/health")
-    print(f"📋 Protocol: UPLOAD → PROCESS → DOWNLOAD")
+    print(f"📋 Protocol: IMAGE + AUDIO → PROCESS → RESPONSE")
     print(f"⚡ Chunk size: {SEND_CHUNK_SIZE/1024:.0f} KB")
-    
-    if os.path.exists(RESPONSE_folder):
-        size = os.path.getsize(RESPONSE_folder)
-        print(f"📤 Response audio: ✅ ({size/1024:.2f} KB)")
-    else:
-        print(f"⚠️  Response audio not found!")
-        print(f"💡 Create: {os.path.abspath(RESPONSE_folder)}")
-    
     print("=" * 60 + "\n")
     print("Press Ctrl+C to stop the server\n")
     

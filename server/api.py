@@ -25,7 +25,7 @@ def start_chat():
 
 def generate_image_response(image_loc,prompt):
   image = Image.open(image_loc)
-  response=llm_model.generate_content(prompt).text
+  response=llm_model.generate_content([image, prompt]).text
   return response
 
 def generate_prompt_response(prompt):
