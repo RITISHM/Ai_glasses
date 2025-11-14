@@ -10,7 +10,7 @@ using namespace websockets;
 // ========== CONFIGURATION ==========
 const char* ssid = "Ritish-laptop";
 const char* password = "07867860";
-const char* ws_server = "ws://10.51.111.72:5000/upload";
+const char* ws_server = "ws://10.114.127.72:5000/upload";
 
 // Recording settings
 const int SAMPLE_RATE = 16000;
@@ -23,14 +23,14 @@ const int UPLOAD_CHUNK_SIZE = 32768;  // 32KB chunks (was 8KB)
 // Connection settings - OPTIMIZED timeouts
 const int MAX_RECONNECT_ATTEMPTS = 2;  // Reduced for faster failure
 const int RECONNECT_DELAY_MS = 1000;   // Reduced delay
-const int WS_TIMEOUT_MS = 45000;       // Reduced to 45s
+const int WS_TIMEOUT_MS = 60000;       // Reduced to 45s
 const int UPLOAD_TIMEOUT_MS = 60000;   // Reduced to 30s
 
 // I2S pins
 const int I2S_MIC_SERIAL_CLOCK = 42;
 const int I2S_MIC_LEFT_RIGHT_CLOCK = 41;
-const int I2S_SPK_SERIAL_DATA = 3;
-const int I2S_SPK_LEFT_RIGHT_CLOCK = 5;
+const int I2S_SPK_SERIAL_DATA = 5;
+const int I2S_SPK_LEFT_RIGHT_CLOCK = 3;
 const int I2S_SPK_SERIAL_CLOCK = 4;
 
 // Camera pins for OV2640 (adjust based on your wiring)
@@ -331,7 +331,7 @@ void setup() {
   Serial.println("========================================\n");
 
   // === Touch sensor ===
-  touchAttachInterrupt(T1, [](){}, TOUCH_THRESHOLD);
+  // touchAttachInterrupt(T1, [](){}, TOUCH_THRESHOLD);
 
   // === SD Card ===
   Serial.print("💾 SD Card...");

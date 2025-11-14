@@ -272,6 +272,7 @@ def upload(ws):
             processing_start = time.time()
             
             try:
+                
                 # Transcribe audio
                 transcribe = speech_to_text(audio_filename)
                 print(f"📝 Transcription: {transcribe[:100]}...")
