@@ -28,7 +28,7 @@ upload_lock = Lock()
 
 # OPTIMIZATION: Increased chunk sizes for faster transfer
 RECEIVE_CHUNK_SIZE = 32768  # 32KB chunks
-SEND_CHUNK_SIZE = 32768     # 32KB chunks
+SEND_CHUNK_SIZE = 1024*33     # 32KB chunks
 
 def send_error_response(ws, message):
     """Send error response to client"""
@@ -272,7 +272,6 @@ def upload(ws):
             processing_start = time.time()
             
             try:
-                
                 # Transcribe audio
                 transcribe = speech_to_text(audio_filename)
                 print(f"📝 Transcription: {transcribe[:100]}...")
@@ -349,7 +348,7 @@ def upload(ws):
                         sent_bytes += len(chunk)
                         send_chunk_count += 1
                         
-                        time.sleep(0.05)
+                        time.sleep(0.01)
                 
                 send_time = time.time() - send_start
                 print(f"✅ Response sent: {sent_bytes/1024:.1f} KB in {send_time:.1f}s ({sent_bytes/send_time/1024:.1f} KB/s)")

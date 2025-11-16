@@ -23,7 +23,7 @@ const int UPLOAD_CHUNK_SIZE = 32768;  // 32KB chunks (was 8KB)
 // Connection settings - OPTIMIZED timeouts
 const int MAX_RECONNECT_ATTEMPTS = 2;  // Reduced for faster failure
 const int RECONNECT_DELAY_MS = 1000;   // Reduced delay
-const int WS_TIMEOUT_MS = 60000;       // Reduced to 45s
+const int WS_TIMEOUT_MS = 120000;       // Reduced to 45s
 const int UPLOAD_TIMEOUT_MS = 60000;   // Reduced to 30s
 
 // I2S pins
@@ -230,14 +230,15 @@ void onMessageCallback(WebsocketsMessage message) {
           verifyFile.close();
           
           if (actualSize >= expectedDownloadSize) {
-            Serial.print("size received=");
-            Serial.println(actualSize/1024);
+            
             Serial.println("▶️  Playing response...\n");
             delay(300);
             playAudioFile("/response.wav");
           }
         }
       }
+      Serial.print("size received=");
+            Serial.println(downloadedBytes/1024);
     }
   }
 }
@@ -590,7 +591,7 @@ void uploadImageAndAudio(const char* imageFile, const char* audioFile, size_t au
       dots++;
     }
     
-    if (millis() - lastActivityTime > 15000) {
+    if (millis() - lastActivityTime > 60000) {
       Serial.println("\n⚠️ Server not responding");
       break;
     }
@@ -617,7 +618,7 @@ bool uploadFile(const char* filename, size_t fileSize) {
     return false;
   }
   
-  const int RELIABLE_CHUNK_SIZE = 4096;
+  const int RELIABLE_CHUNK_SIZE = 32768;
   uint8_t* buffer = (uint8_t*)malloc(RELIABLE_CHUNK_SIZE);
   
   if (!buffer) {
