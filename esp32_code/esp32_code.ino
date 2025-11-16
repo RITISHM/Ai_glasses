@@ -10,7 +10,7 @@ using namespace websockets;
 // ========== CONFIGURATION ==========
 const char* ssid = "Ritish-laptop";
 const char* password = "07867860";
-const char* ws_server = "ws://10.114.127.72:5000/upload";
+const char* ws_server = "ws://10.37.217.72:5000/upload";
 
 // Recording settings
 const int SAMPLE_RATE = 16000;
@@ -233,7 +233,7 @@ void onMessageCallback(WebsocketsMessage message) {
             
             Serial.println("▶️  Playing response...\n");
             delay(300);
-            playAudioFile("/response.wav");
+            
           }
         }
       }
@@ -312,9 +312,9 @@ bool connectWebSocket() {
 }
 
 void cleanupWebSocket() {
-  if (wsClient.available()) {
-    wsClient.close();
-  }
+  // if (wsClient.available()) {
+  //   wsClient.close();
+  // }
   
   if (receivingAudio && downloadFile) {
     downloadFile.flush();
@@ -603,6 +603,7 @@ void uploadImageAndAudio(const char* imageFile, const char* audioFile, size_t au
   
   if (uploadComplete) {
     Serial.println("✅ Transaction complete\n");
+    playAudioFile("/response.wav");
   } else {
     Serial.println("⚠️ No response received\n");
   }
