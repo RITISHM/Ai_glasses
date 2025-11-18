@@ -10,7 +10,7 @@ using namespace websockets;
 // ========== CONFIGURATION ==========
 const char* ssid = "Ritish-laptop";
 const char* password = "07867860";
-const char* ws_server = "ws://10.37.217.72:5000/upload";
+const char* ws_server = "ws://10.82.83.72:5000/upload";
 
 // Recording settings
 const int SAMPLE_RATE = 16000;

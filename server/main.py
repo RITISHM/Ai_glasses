@@ -34,7 +34,7 @@ broadcast_clients = set()
 # OPTIMIZATION: Increased chunk sizes for faster transfer
 RECEIVE_CHUNK_SIZE = 32768  # 32KB chunks
 SEND_CHUNK_SIZE = 1024*33     # 32KB chunks
-
+chat_started=False
 def send_error_response(ws, message):
     """Send error response to client"""
     try:
@@ -317,7 +317,11 @@ def upload(ws):
             # ===== PROCESS AUDIO AND IMAGE =====
             print(f"🤖 Processing audio and image...")
             processing_start = time.time()
-            
+            global chat_started
+            if not chat_started:
+                print("🚀 Starting new chat session...")
+                start_chat()
+                chat_started = True
             try:
                 # Transcribe audio
                 transcribe = speech_to_text(audio_filepath)

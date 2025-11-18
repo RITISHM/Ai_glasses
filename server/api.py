@@ -25,10 +25,16 @@ def start_chat():
 
 def generate_image_response(image_loc,prompt):
   image = Image.open(image_loc)
+  if chat is not   None:
+    response=chat.send_message([image, prompt]).text
+    return response
   response=llm_model.generate_content([image, prompt]).text
   return response
 
 def generate_prompt_response(prompt):
+  if chat is not  None:
+    response=chat.send_message(prompt).text
+    return response
   response=llm_model.generate_content(prompt).text
   return response
 
